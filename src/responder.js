@@ -28,7 +28,8 @@ export class ResponderClient {
       ["RESPONDER_USER_KEY", c.userKey],
       ["RESPONDER_USER_SECRET", c.userSecret],
     ].filter(([, v]) => !v).map(([k]) => k);
-    if (missing.length) throw new Error(`Missing environment variables: ${missing.join(", ")}`);
+    c.missing = missing;
+    if (missing.length) console.error(`Warning: missing environment variables: ${missing.join(", ")}`);
     return c;
   }
 
@@ -55,6 +56,9 @@ export class ResponderClient {
    * @param {object} [opts.form]  form fields; object/array values are JSON-stringified, as the API requires
    */
   async request(method, path, { query, form } = {}) {
+    if (this.missing?.length) {
+      throw new Error(`Rav Messer keys are not configured on the server. Missing: ${this.missing.join(", ")}`);
+    }
     const url = new URL(this.baseUrl + path);
     for (const [k, v] of Object.entries(query || {})) {
       if (v === undefined || v === null || v === "") continue;
