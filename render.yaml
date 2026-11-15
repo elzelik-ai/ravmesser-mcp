@@ -2,7 +2,7 @@ services:
   - type: web
     name: ravmesser-mcp
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm ci --omit=dev
     startCommand: node src/http.js
     healthCheckPath: /healthz
