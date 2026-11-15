@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: ravmesser-mcp
+    runtime: node
+    plan: starter
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/http.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: MCP_ACCESS_TOKEN
+        generateValue: true
+      - key: RESPONDER_CLIENT_KEY
+        sync: false
+      - key: RESPONDER_CLIENT_SECRET
+        sync: false
+      - key: RESPONDER_USER_KEY
+        sync: false
+      - key: RESPONDER_USER_SECRET
+        sync: false
+      - key: RESPONDER_READ_ONLY
+        value: "false"
