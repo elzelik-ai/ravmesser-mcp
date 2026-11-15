@@ -1,69 +1,36 @@
-// MCP tool definitions for Rav Messer (Responder).
+// MCP tool definitions for Rav Messer (Responder Live API V2).
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 const id = z.union([z.number().int(), z.string().regex(/^\d+$/)]).describe("Numeric ID");
 const listId = id.describe("List ID (from list_lists)");
-const limit = z.number().int().min(1).max(500).optional().describe("Max results (1-500, API default 500)");
-const offset = z.number().int().min(0).optional().describe("Start position for paging");
-const personalFields = z.record(z.string(), z.string())
-  .describe('Personal field values keyed by field ID, e.g. {"123": "Tel Aviv"} (IDs from get_personal_fields)');
+const subscriberId = id.describe("Subscriber ID (from get_subscriber / search_subscribers)");
 const confirm = z.literal(true).describe("Must be true. Only set it after the user explicitly confirmed this action.");
+const personalFields = z.record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+  .describe('Personal field values keyed by field ID, e.g. {"123": "Tel Aviv"} (IDs from get_personal_fields)');
+const who = z.object({
+  subscriber_id: id.optional(),
+  email: z.string().optional(),
+  phone: z.string().optional(),
+}).refine((v) => v.subscriber_id || v.email || v.phone, "Give subscriber_id, email or phone");
 
-const subscriberIn = z.object({
-  EMAIL: z.string().optional(),
-  NAME: z.string().optional(),
-  PHONE: z.string().optional().describe("Israeli phone; prefixes 056/059 are rejected by the API"),
-  DAY: z.number().int().optional().describe("Seniority day in the list (0 = start of the sequence)"),
-  SEND_0: z.union([z.literal(0), z.literal(1)]).optional().describe("Send the list's first message (default 1)"),
-  PHONE_IGNORE: z.boolean().optional().describe("Create even if phone is invalid (phone is dropped)"),
-  NOTIFY: z.union([z.literal(0), z.literal(1), z.literal(2)]).optional().describe("Notify list owner: 0 no, 1 yes, 2 per list settings"),
-  PERSONAL_FIELDS: personalFields.optional(),
-}).passthrough();
-
-const idOrEmail = z.union([
-  z.object({ ID: id }),
-  z.object({ EMAIL: z.string() }),
-]);
-
-const listInfo = z.object({
-  DESCRIPTION: z.string().optional().describe("List display name"),
-  NAME: z.string().optional().describe("Internal English name"),
-  SENDER_NAME: z.string().optional(),
-  SENDER_EMAIL: z.string().optional(),
-  SENDER_ADDRESS: z.string().optional(),
-  REMOVE_TITLE: z.string().optional(),
-  SITE_NAME: z.string().optional(),
-  SITE_URL: z.string().optional(),
-  LOGO: z.string().optional(),
-  EMAIL_NOTIFY: z.array(z.string()).optional().describe("Owner notification emails (replaces existing on update)"),
-  AUTOMATION: z.array(id).optional().describe("List IDs for automation (replaces existing on update)"),
-}).passthrough();
-
-const messageInfo = z.object({
-  TYPE: z.enum(["0", "1", "2"]).optional().describe('"1" one-off message, "0" sequence (autoresponder), "2" date-based'),
-  BODY_TYPE: z.string().optional().describe('"0" = regular HTML editor'),
-  SUBJECT: z.string().optional(),
-  BODY: z.string().optional().describe("HTML body"),
-  FILTER: z.string().optional().describe("View (segment) ID to send to"),
-  LANGUAGE: z.enum(["hebrew", "english"]).optional(),
-  CHECK_LINKS: z.enum(["0", "1"]).optional(),
-}).passthrough();
+const FIELD_TYPES = "type_id: 1-8 (8 = yes/no). Check existing fields with get_personal_fields for the types in use.";
 
 const json = (data) => ({ content: [{ type: "text", text: JSON.stringify(data, null, 2) }] });
+const toInt = (v) => Number(v);
 
 /**
  * @param {import("./responder.js").ResponderClient} client
  * @param {{readOnly?: boolean}} opts
  */
 export function buildServer(client, { readOnly = false } = {}) {
-  const server = new McpServer({ name: "ravmesser", version: "1.0.0" });
+  const server = new McpServer({ name: "ravmesser", version: "2.0.0" });
 
   const tool = (name, { write = false, destructive = false, ...def }, handler) => {
     if (write && readOnly) return;
     server.registerTool(name, {
       ...def,
-      annotations: { readOnlyHint: !write, destructiveHint: destructive, openWorldHint: true, ...(def.annotations || {}) },
+      annotations: { readOnlyHint: !write, destructiveHint: destructive, openWorldHint: true },
     }, async (args) => {
       try {
         return json(await handler(args));
@@ -76,189 +43,218 @@ export function buildServer(client, { readOnly = false } = {}) {
   // ---------------- Lists
   tool("list_lists", {
     title: "List mailing lists",
-    description: "Get the account's mailing lists (ID, name, sender details). Use list_ids to fetch specific ones.",
-    inputSchema: { list_ids: z.array(id).optional(), limit, offset },
-  }, ({ list_ids, ...q }) => client.getLists({ ...q, list_ids: list_ids?.join(",") }));
+    description: "Get all mailing lists in the Rav Messer account (id, name, subscriber count, flags).",
+    inputSchema: {},
+  }, () => client.getLists());
+
+  tool("get_list", {
+    title: "Get list",
+    description: "Get one list's details by ID.",
+    inputSchema: { list_id: listId },
+  }, ({ list_id }) => client.getList(list_id));
 
   tool("create_list", {
     write: true, title: "Create list",
     description: "Create a new mailing list.",
-    inputSchema: { info: listInfo },
-  }, ({ info }) => client.createList(info));
-
-  tool("update_list", {
-    write: true, title: "Update list",
-    description: "Update list settings. Note: EMAIL_NOTIFY / AUTOMATION replace the existing values.",
-    inputSchema: { list_id: listId, info: listInfo },
-  }, ({ list_id, info }) => client.updateList(list_id, info));
-
-  tool("delete_list", {
-    write: true, destructive: true, title: "Delete list",
-    description: "Permanently delete a list and its subscribers. Irreversible - confirm with the user first.",
-    inputSchema: { list_id: listId, confirm },
-  }, ({ list_id }) => client.deleteList(list_id));
-
-  // ---------------- Subscribers
-  tool("get_subscribers", {
-    title: "Get subscribers",
-    description: "Get subscribers of a list. Filter by a single subscriber (ID or email) or by join date. STATUS 1 = active; STATUS_NUM explains inactivity (0 automation, 1 removed/unsubscribed, 2 bounced).",
     inputSchema: {
-      list_id: listId, limit, offset,
-      dir: z.union([z.literal(0), z.literal(1)]).optional().describe("0 oldest first, 1 newest first"),
-      subscriber_id: z.string().optional().describe("Subscriber ID or email"),
-      min_join_date: z.string().regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/).optional().describe('"YYYY-MM-DD HH:mm"'),
-      max_join_date: z.string().regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/).optional().describe('"YYYY-MM-DD HH:mm"'),
+      name: z.string(),
+      public_name: z.string().optional().describe("Name shown to subscribers"),
+      sender_id: id.optional(),
+      is_double_opt_in: z.boolean().optional(),
+      is_hidden: z.boolean().optional(),
+      tags: z.array(id).optional().describe("Tag IDs"),
     },
-  }, ({ list_id, ...q }) => client.getSubscribers(list_id, q));
+  }, ({ tags, sender_id, ...rest }) =>
+    client.createList({ ...rest, ...(sender_id ? { sender_id: toInt(sender_id) } : {}), ...(tags ? { tags: tags.map(toInt) } : {}) }));
 
-  tool("add_subscribers", {
-    write: true, title: "Add subscribers",
-    description: "Add one or more subscribers to a list (needs EMAIL and/or PHONE). Response lists created, existing, invalid and banned entries.",
-    inputSchema: { list_id: listId, subscribers: z.array(subscriberIn).min(1).max(500) },
-  }, ({ list_id, subscribers }) => client.createSubscribers(list_id, subscribers));
-
-  tool("update_subscribers", {
-    write: true, title: "Update subscribers",
-    description: "Update existing subscribers. Each item needs IDENTIFIER (subscriber ID or current email) plus fields to change.",
+  tool("get_list_subscribers", {
+    title: "Get list subscribers",
+    description: "Get subscriptions in a list (subscriber_id, active/inactive/pending, join dates). The API returns the whole list; this tool pages it with limit/offset. Use get_subscriber for names/emails.",
     inputSchema: {
       list_id: listId,
-      subscribers: z.array(subscriberIn.extend({ IDENTIFIER: z.union([id, z.string()]) })).min(1).max(500),
+      limit: z.number().int().min(1).max(1000).optional().describe("Default 100"),
+      offset: z.number().int().min(0).optional(),
     },
-  }, ({ list_id, subscribers }) => client.updateSubscribers(list_id, subscribers));
+  }, async ({ list_id, limit = 100, offset = 0 }) => {
+    const r = await client.getListSubscribers(list_id);
+    const data = Array.isArray(r?.data) ? r.data : [];
+    return { total: r?.total ?? data.length, offset, returned: Math.min(limit, Math.max(0, data.length - offset)), data: data.slice(offset, offset + limit) };
+  });
 
-  tool("delete_subscribers", {
-    write: true, destructive: true, title: "Delete subscribers",
-    description: "Delete subscribers from a list by ID or email. This erases their history; to stop mailing someone, prefer update with removal in the Rav Messer UI. Confirm with the user first.",
-    inputSchema: { list_id: listId, subscribers: z.array(idOrEmail).min(1).max(500), confirm },
-  }, ({ list_id, subscribers }) => client.deleteSubscribers(list_id, subscribers));
+  tool("get_list_fields", {
+    title: "Get list fields",
+    description: "Get the fields available in a list, including list-specific and account-wide personal fields.",
+    inputSchema: { list_id: listId },
+  }, ({ list_id }) => client.getListFields(list_id));
+
+  // ---------------- Subscribers
+  tool("get_subscriber", {
+    title: "Get subscriber",
+    description: "Look up one subscriber by email, phone or subscriber ID: details, lists, personal fields.",
+    inputSchema: { identifier: z.string().describe("Email, phone or subscriber ID") },
+  }, ({ identifier }) => client.getSubscriber(identifier));
+
+  tool("search_subscribers", {
+    title: "Search subscribers in list",
+    description: "Search subscribers in a list by keyword (name, email, phone).",
+    inputSchema: {
+      list_id: listId,
+      search: z.string(),
+      offset: z.number().int().min(0).optional(),
+      size: z.number().int().min(1).max(500).optional().describe("Default 50"),
+    },
+  }, ({ list_id, search, offset, size }) => client.searchSubscribers(list_id, search, offset ?? 0, size ?? 50));
+
+  tool("add_subscriber", {
+    write: true, title: "Add subscriber",
+    description: "Add a subscriber to one or more lists. If the email already exists, set override/rejoin to update and re-activate.",
+    inputSchema: {
+      email: z.string(),
+      list_ids: z.array(id).min(1),
+      first: z.string().optional(),
+      last: z.string().optional(),
+      phone: z.string().optional(),
+      personal_fields: personalFields.optional(),
+      tags: z.array(id).optional().describe("Existing tag IDs"),
+      tags_names: z.array(z.string()).optional().describe("Tag names (created if missing)"),
+      override: z.boolean().optional().describe("Overwrite details of an existing subscriber"),
+      rejoin: z.boolean().optional().describe("Re-activate if previously removed from the list"),
+      disable_notification: z.boolean().optional().describe("Don't email the account owner about the new subscriber"),
+    },
+  }, ({ list_ids, tags, ...rest }) =>
+    client.createSubscriber({ ...rest, list_ids: list_ids.map(toInt), ...(tags ? { tags: tags.map(toInt) } : {}) }));
+
+  tool("update_subscriber", {
+    write: true, title: "Update subscriber",
+    description: "Update a subscriber's details (name, email, phone, personal fields, add tags by name).",
+    inputSchema: {
+      subscriber_id: subscriberId,
+      first: z.string().optional(),
+      last: z.string().optional(),
+      email: z.string().optional(),
+      phone: z.string().optional(),
+      personal_fields: personalFields.optional(),
+      tags_names: z.array(z.string()).optional(),
+    },
+  }, ({ subscriber_id, ...body }) => client.updateSubscriber(subscriber_id, body));
+
+  tool("set_list_subscription", {
+    write: true, title: "Activate / deactivate in list",
+    description: "Change a subscriber's status inside one list (inactive/pending).",
+    inputSchema: {
+      list_id: listId, subscriber_id: subscriberId,
+      inactive: z.boolean().optional(),
+      pending: z.boolean().optional(),
+    },
+  }, ({ list_id, subscriber_id, ...body }) => client.updateListSubscription(list_id, subscriber_id, body));
+
+  tool("unsubscribe", {
+    write: true, title: "Unsubscribe",
+    description: "Mark a subscriber as unsubscribed (stops mailing; keeps history). Prefer this over deleting.",
+    inputSchema: { who },
+  }, ({ who: w }) => client.unsubscribe(w.subscriber_id ? { subscriber_id: toInt(w.subscriber_id) } : w.email ? { email: w.email } : { phone: w.phone }));
+
+  tool("resubscribe", {
+    write: true, title: "Re-subscribe",
+    description: "Mark a previously unsubscribed subscriber as subscribed again. Only with the person's consent.",
+    inputSchema: { who },
+  }, ({ who: w }) => client.resubscribe(w.subscriber_id ? { subscriber_id: toInt(w.subscriber_id) } : w.email ? { email: w.email } : { phone: w.phone }));
+
+  tool("remove_from_list", {
+    write: true, destructive: true, title: "Remove from list",
+    description: "Remove a subscriber from one list (stays in the account). Confirm with the user first.",
+    inputSchema: { list_id: listId, subscriber_id: subscriberId, confirm },
+  }, ({ list_id, subscriber_id }) => client.removeFromList(list_id, subscriber_id));
+
+  tool("delete_subscriber", {
+    write: true, destructive: true, title: "Delete subscriber",
+    description: "Permanently delete a subscriber from the whole account, including history. Irreversible - prefer unsubscribe. Confirm with the user first.",
+    inputSchema: { subscriber_id: subscriberId, confirm },
+  }, ({ subscriber_id }) => client.deleteSubscriber(subscriber_id));
 
   // ---------------- Personal fields
   tool("get_personal_fields", {
     title: "Get personal fields",
-    description: "Get a list's custom (personal) fields: ID, NAME, TYPE, default value.",
-    inputSchema: { list_id: listId, limit, offset },
-  }, ({ list_id, ...q }) => client.getPersonalFields(list_id, q));
+    description: "Get custom (personal) fields - for the whole account, or for one list if list_id is given.",
+    inputSchema: { list_id: listId.optional() },
+  }, ({ list_id }) => (list_id ? client.getListPersonalFields(list_id) : client.getPersonalFields()));
 
-  tool("create_personal_fields", {
-    write: true, title: "Create personal fields",
-    description: "Create custom fields in a list. TYPE 0 = text, 1 = date.",
+  tool("create_personal_field", {
+    write: true, title: "Create personal field",
+    description: `Create a custom field in the account, or in one list if list_id is given. ${FIELD_TYPES}`,
     inputSchema: {
-      list_id: listId,
-      personal_fields: z.array(z.object({
-        NAME: z.string(),
-        TYPE: z.number().int().optional(),
-        DEFAULT_VALUE: z.string().optional(),
-        DIR: z.enum(["rtl", "ltr"]).optional(),
-      }).passthrough()).min(1),
+      name: z.string(),
+      type_id: z.number().int().min(1).max(8),
+      list_id: listId.optional(),
+      default: z.string().optional(),
+      hidden: z.union([z.literal(0), z.literal(1)]).optional(),
+      options: z.array(z.object({ name: z.string(), is_default: z.union([z.literal(0), z.literal(1)]).optional() })).optional()
+        .describe("Choices, for selection-type fields"),
     },
-  }, ({ list_id, personal_fields }) => client.createPersonalFields(list_id, personal_fields));
+  }, ({ list_id, ...body }) => client.createPersonalField({ ...body, ...(list_id ? { list_id: toInt(list_id) } : {}) }));
 
-  tool("update_personal_fields", {
-    write: true, title: "Update personal fields",
-    description: "Update custom fields by ID.",
+  tool("update_personal_field", {
+    write: true, title: "Update personal field",
+    description: `Update a custom field. name and type_id are required by the API (send the current values if unchanged). ${FIELD_TYPES}`,
     inputSchema: {
-      list_id: listId,
-      personal_fields: z.array(z.object({
-        ID: id, NAME: z.string().optional(), DEFAULT_VALUE: z.string().optional(), DIR: z.enum(["rtl", "ltr"]).optional(),
-      }).passthrough()).min(1),
+      field_id: id,
+      name: z.string(),
+      type_id: z.number().int().min(1).max(8),
+      default: z.string().optional(),
+      hidden: z.union([z.literal(0), z.literal(1)]).optional(),
+      options: z.array(z.object({ id: id.optional(), name: z.string(), is_default: z.union([z.literal(0), z.literal(1)]).optional() })).optional(),
     },
-  }, ({ list_id, personal_fields }) => client.updatePersonalFields(list_id, personal_fields));
+  }, ({ field_id, ...body }) => client.updatePersonalField(field_id, body));
 
-  tool("delete_personal_fields", {
-    write: true, destructive: true, title: "Delete personal fields",
-    description: "Delete custom fields (and their stored values). Confirm with the user first.",
-    inputSchema: { list_id: listId, field_ids: z.array(id).min(1), confirm },
-  }, ({ list_id, field_ids }) => client.deletePersonalFields(list_id, field_ids.map((ID) => ({ ID }))));
+  // ---------------- Tags
+  tool("list_tags", {
+    title: "List tags",
+    description: "Get all subscriber tags in the account.",
+    inputSchema: {},
+  }, () => client.getTags());
 
-  // ---------------- Views (segments)
-  tool("get_views", {
-    title: "Get views (segments)",
-    description: "Get a list's views - the sending groups / segments (קבוצות משלוח).",
-    inputSchema: { list_id: listId, limit, offset },
-  }, ({ list_id, ...q }) => client.getViews(list_id, q));
+  tool("get_subscriber_tags", {
+    title: "Get subscriber's tags",
+    description: "Get the tags of one subscriber.",
+    inputSchema: { subscriber_id: subscriberId },
+  }, ({ subscriber_id }) => client.getSubscriberTags(subscriber_id));
 
-  tool("create_views", {
-    write: true, title: "Create views",
-    description: "Create views (segments) in a list by name.",
-    inputSchema: { list_id: listId, names: z.array(z.string()).min(1) },
-  }, ({ list_id, names }) => client.createViews(list_id, names.map((NAME) => ({ NAME }))));
+  tool("create_tag", {
+    write: true, title: "Create tag",
+    description: "Create a new subscriber tag. To tag a subscriber, use update_subscriber with tags_names.",
+    inputSchema: { name: z.string() },
+  }, ({ name }) => client.createTag(name));
 
-  tool("rename_views", {
-    write: true, title: "Rename views",
-    description: "Rename views by ID.",
-    inputSchema: { list_id: listId, views: z.array(z.object({ ID: id, NAME: z.string() })).min(1) },
-  }, ({ list_id, views }) => client.updateViews(list_id, views));
+  tool("remove_tag", {
+    write: true, title: "Remove tag from subscriber",
+    description: "Remove a tag from a subscriber.",
+    inputSchema: { subscriber_id: subscriberId, tag_id: id },
+  }, ({ subscriber_id, tag_id }) => client.removeTag(subscriber_id, tag_id));
 
-  tool("delete_views", {
-    write: true, destructive: true, title: "Delete views",
-    description: "Delete views (segments). Subscribers stay in the list. Confirm with the user first.",
-    inputSchema: { list_id: listId, view_ids: z.array(id).min(1), confirm },
-  }, ({ list_id, view_ids }) => client.deleteViews(list_id, view_ids.map((ID) => ({ ID }))));
+  // ---------------- Do-not-mail lists
+  tool("list_blocked", {
+    title: "List blocked emails / phones",
+    description: "Get the account's do-not-contact list (unwanted emails or phones).",
+    inputSchema: { kind: z.enum(["email", "phone"]) },
+  }, ({ kind }) => (kind === "email" ? client.getUnwantedEmails() : client.getUnwantedPhones()));
 
-  tool("get_view_subscribers", {
-    title: "Get view subscribers",
-    description: "Get subscriber IDs in a view (segment), with the date they were added.",
-    inputSchema: { list_id: listId, view_id: id, limit, offset },
-  }, ({ list_id, view_id, ...q }) => client.getViewSubscribers(list_id, view_id, q));
+  tool("block_contact", {
+    write: true, title: "Block email / phone",
+    description: "Add an email or phone to the do-not-contact list - it will never be mailed/texted.",
+    inputSchema: { email: z.string().optional(), phone: z.string().optional() },
+  }, ({ email, phone }) => {
+    if (!email && !phone) throw new Error("Give email or phone");
+    return email ? client.addUnwantedEmail(email) : client.addUnwantedPhone(phone);
+  });
 
-  tool("add_view_subscribers", {
-    write: true, title: "Add subscribers to view",
-    description: "Add existing list subscribers (by subscriber ID) to a view.",
-    inputSchema: { list_id: listId, view_id: id, subscriber_ids: z.array(id).min(1).max(500) },
-  }, ({ list_id, view_id, subscriber_ids }) =>
-    client.addViewSubscribers(list_id, view_id, subscriber_ids.map((ID) => ({ ID: String(ID) }))));
-
-  tool("remove_view_subscribers", {
-    write: true, title: "Remove subscribers from view",
-    description: "Remove subscribers from a view (they stay in the list).",
-    inputSchema: { list_id: listId, view_id: id, subscribers: z.array(idOrEmail).min(1).max(500) },
-  }, ({ list_id, view_id, subscribers }) => client.removeViewSubscribers(list_id, view_id, subscribers));
-
-  // ---------------- Messages
-  tool("get_messages", {
-    title: "Get messages",
-    description: "Get messages of a list, or one message with message_id. Includes stats (POSTED, OPENED, LINKED, REMOVED...). Message TYPE: 0 sequence, 1 one-off, 2 date-based.",
-    inputSchema: {
-      list_id: listId, message_id: id.optional(), limit, offset,
-      types: z.array(z.enum(["0", "1", "2", "3", "4"])).optional(),
-    },
-  }, ({ list_id, message_id, types, ...q }) =>
-    message_id ? client.getMessage(list_id, message_id) : client.getMessages(list_id, { ...q, type: types }));
-
-  tool("create_message", {
-    write: true, title: "Create message (draft)",
-    description: "Create a message in a list. This does NOT send it - use test_message, then send_message.",
-    inputSchema: { list_id: listId, info: messageInfo.extend({ SUBJECT: z.string(), BODY: z.string() }) },
-  }, ({ list_id, info }) => client.createMessage(list_id, { TYPE: "1", BODY_TYPE: "0", ...info }));
-
-  tool("update_message", {
-    write: true, title: "Update message",
-    description: "Update an existing message's subject, body, segment etc.",
-    inputSchema: { list_id: listId, message_id: id, info: messageInfo },
-  }, ({ list_id, message_id, info }) => client.updateMessage(list_id, message_id, info));
-
-  tool("test_message", {
-    write: true, title: "Send test message",
-    description: "Send a test copy of a message to one email address.",
-    inputSchema: {
-      list_id: listId, message_id: id,
-      email: z.string(), name: z.string().optional(), phone: z.string().optional(),
-      personal_fields: personalFields.optional(),
-    },
-  }, ({ list_id, message_id, personal_fields, ...rest }) =>
-    client.testMessage(list_id, message_id, { ...rest, ...(personal_fields ? { personal_fields: [personal_fields] } : {}) }));
-
-  tool("send_message", {
-    write: true, destructive: true, title: "Send message to list",
-    description: "SEND a message to the list's subscribers (or its FILTER view). Cannot be undone. Show the user the list, subject and audience and get explicit confirmation first.",
-    inputSchema: { list_id: listId, message_id: id, confirm },
-  }, ({ list_id, message_id }) => client.sendMessage(list_id, message_id));
-
-  tool("delete_messages", {
-    write: true, destructive: true, title: "Delete messages",
-    description: "Delete messages from a list. Confirm with the user first.",
-    inputSchema: { list_id: listId, message_ids: z.array(id).min(1), confirm },
-  }, ({ list_id, message_ids }) => client.deleteMessages(list_id, message_ids.map(String)));
+  tool("unblock_contact", {
+    write: true, title: "Unblock email / phone",
+    description: "Remove an email or phone from the do-not-contact list. Only with the person's consent.",
+    inputSchema: { email: z.string().optional(), phone: z.string().optional() },
+  }, ({ email, phone }) => {
+    if (!email && !phone) throw new Error("Give email or phone");
+    return email ? client.removeUnwantedEmail(email) : client.removeUnwantedPhone(phone);
+  });
 
   return server;
 }

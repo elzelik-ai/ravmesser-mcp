@@ -1,127 +1,131 @@
-// Minimal client for the Rav Messer (Responder) REST API.
-// Docs: https://github.com/responder/restapi
-import crypto from "node:crypto";
+// Client for the Rav Messer "Responder Live" API (V2).
+// Spec: https://app.swaggerhub.com/apis/Responder/responder/V2.0
+// Auth: POST /oauth/token with client_id, client_secret, user_token -> { token } (valid 14 days),
+// then "Authorization: Bearer <token>" on every call.
 
-const md5 = (s) => crypto.createHash("md5").update(s).digest("hex");
+const TOKEN_TTL_MS = 13 * 24 * 60 * 60 * 1000; // refresh a day before the documented 14-day expiry
 
 export class ResponderClient {
-  constructor({ clientKey, clientSecret, userKey, userSecret, baseUrl, timeoutMs } = {}) {
-    this.clientKey = clientKey;
+  constructor({ clientId, clientSecret, userToken, baseUrl, timeoutMs } = {}) {
+    this.clientId = clientId;
     this.clientSecret = clientSecret;
-    this.userKey = userKey;
-    this.userSecret = userSecret;
-    this.baseUrl = (baseUrl || "https://api.responder.co.il/main").replace(/\/+$/, "");
+    this.userToken = userToken;
+    this.baseUrl = (baseUrl || "https://graph.responder.live/v2").replace(/\/+$/, "");
     this.timeoutMs = timeoutMs || 30000;
+    this.token = null;
+    this.tokenAt = 0;
+    this.missing = [
+      ["RESPONDER_CLIENT_ID", clientId],
+      ["RESPONDER_CLIENT_SECRET", clientSecret],
+      ["RESPONDER_USER_TOKEN", userToken],
+    ].filter(([, v]) => !v).map(([k]) => k);
   }
 
   static fromEnv(env = process.env) {
     const c = new ResponderClient({
-      clientKey: env.RESPONDER_CLIENT_KEY,
+      clientId: env.RESPONDER_CLIENT_ID,
       clientSecret: env.RESPONDER_CLIENT_SECRET,
-      userKey: env.RESPONDER_USER_KEY,
-      userSecret: env.RESPONDER_USER_SECRET,
+      userToken: env.RESPONDER_USER_TOKEN,
       baseUrl: env.RESPONDER_BASE_URL,
     });
-    const missing = [
-      ["RESPONDER_CLIENT_KEY", c.clientKey],
-      ["RESPONDER_CLIENT_SECRET", c.clientSecret],
-      ["RESPONDER_USER_KEY", c.userKey],
-      ["RESPONDER_USER_SECRET", c.userSecret],
-    ].filter(([, v]) => !v).map(([k]) => k);
-    c.missing = missing;
-    if (missing.length) console.error(`Warning: missing environment variables: ${missing.join(", ")}`);
+    if (c.missing.length) console.error(`Warning: missing environment variables: ${c.missing.join(", ")}`);
     return c;
   }
 
-  // Authorization: c_key=..,c_secret=md5(secret+nonce),u_key=..,u_secret=md5(secret+nonce),nonce=..,timestamp=..
-  authHeader() {
-    const nonce = md5(`${process.hrtime.bigint()}${crypto.randomBytes(16).toString("hex")}`);
-    const timestamp = Math.floor(Date.now() / 1000);
-    const parts = {
-      c_key: this.clientKey,
-      c_secret: md5(this.clientSecret + nonce),
-      u_key: this.userKey,
-      u_secret: md5(this.userSecret + nonce),
-      nonce,
-      timestamp: String(timestamp),
-    };
-    return Object.entries(parts).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join(",");
-  }
-
-  /**
-   * @param {string} method GET | POST | PUT | DELETE
-   * @param {string} path   e.g. "/lists/123/subscribers"
-   * @param {object} [opts]
-   * @param {object} [opts.query] query-string params (undefined values dropped; arrays/objects JSON-encoded)
-   * @param {object} [opts.form]  form fields; object/array values are JSON-stringified, as the API requires
-   */
-  async request(method, path, { query, form } = {}) {
-    if (this.missing?.length) {
-      throw new Error(`Rav Messer keys are not configured on the server. Missing: ${this.missing.join(", ")}`);
-    }
+  async #fetchJson(method, path, { query, body, auth = true } = {}) {
     const url = new URL(this.baseUrl + path);
     for (const [k, v] of Object.entries(query || {})) {
-      if (v === undefined || v === null || v === "") continue;
-      url.searchParams.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+      if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
     }
-    const headers = { Authorization: this.authHeader(), Accept: "application/json" };
-    let body;
-    if (form) {
-      const p = new URLSearchParams();
-      for (const [k, v] of Object.entries(form)) {
-        if (v === undefined) continue;
-        p.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
-      }
-      body = p.toString();
-      headers["Content-Type"] = "application/x-www-form-urlencoded";
-    }
-
-    const res = await fetch(url, { method, headers, body, signal: AbortSignal.timeout(this.timeoutMs) });
+    const headers = { Accept: "application/json" };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (auth) headers.Authorization = `Bearer ${this.token}`;
+    const res = await fetch(url, {
+      method, headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
     const text = await res.text();
     let data;
     try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-    if (!res.ok) {
-      const err = new Error(`Rav Messer API ${method} ${url.pathname} failed: HTTP ${res.status} ${typeof data === "string" ? data.slice(0, 500) : JSON.stringify(data)}`);
-      err.status = res.status;
-      err.data = data;
+    return { res, data, url };
+  }
+
+  async #login() {
+    const { res, data } = await this.#fetchJson("POST", "/oauth/token", {
+      auth: false,
+      body: {
+        grant_type: "client_credentials",
+        scope: "*",
+        client_id: /^\d+$/.test(String(this.clientId)) ? Number(this.clientId) : this.clientId,
+        client_secret: this.clientSecret,
+        user_token: this.userToken,
+      },
+    });
+    if (!res.ok || !data?.token) {
+      const msg = (data && (data.message || data.error)) || `HTTP ${res.status}`;
+      throw new Error(`Rav Messer login failed: ${typeof msg === "string" ? msg : JSON.stringify(msg)}. Check Client ID, Client Secret and User Token, and that API access is turned on in Rav Messer settings.`);
+    }
+    this.token = data.token;
+    this.tokenAt = Date.now();
+  }
+
+  async request(method, path, opts = {}) {
+    if (this.missing.length) {
+      throw new Error(`Rav Messer keys are not configured on the server. Missing: ${this.missing.join(", ")}`);
+    }
+    if (!this.token || Date.now() - this.tokenAt > TOKEN_TTL_MS) await this.#login();
+    let r = await this.#fetchJson(method, path, opts);
+    if (r.res.status === 401) { // token revoked/expired early - log in again once
+      await this.#login();
+      r = await this.#fetchJson(method, path, opts);
+    }
+    if (!r.res.ok) {
+      const detail = typeof r.data === "string" ? r.data.slice(0, 500) : JSON.stringify(r.data);
+      const err = new Error(`Rav Messer API ${method} ${r.url.pathname} failed: HTTP ${r.res.status} ${detail}`);
+      err.status = r.res.status;
       throw err;
     }
-    return data;
+    return r.data;
   }
 
   // ---- Lists
-  getLists(q) { return this.request("GET", "/lists", { query: q }); }
-  createList(info) { return this.request("POST", "/lists", { form: { info } }); }
-  updateList(listId, info) { return this.request("PUT", `/lists/${listId}`, { form: { info } }); }
-  deleteList(listId) { return this.request("DELETE", `/lists/${listId}`); }
+  getLists() { return this.request("GET", "/lists"); }
+  getList(id) { return this.request("GET", `/lists/${id}`); }
+  createList(body) { return this.request("POST", "/lists", { body }); }
+  getListSubscribers(id) { return this.request("GET", `/lists/${id}/subscribers`); }
+  getListFields(id) { return this.request("GET", `/lists/${id}/fields`); }
+  getListPersonalFields(id) { return this.request("GET", `/lists/${id}/personal-fields`); }
+  updateListSubscription(listId, subId, body) { return this.request("PUT", `/lists/${listId}/subscribers/${subId}`, { body }); }
+  removeFromList(listId, subId) { return this.request("DELETE", `/lists/${listId}/subscribers/${subId}`); }
 
-  // ---- Subscribers (by list)
-  getSubscribers(listId, q) { return this.request("GET", `/lists/${listId}/subscribers`, { query: q }); }
-  createSubscribers(listId, subscribers) { return this.request("POST", `/lists/${listId}/subscribers`, { form: { subscribers } }); }
-  updateSubscribers(listId, subscribers) { return this.request("PUT", `/lists/${listId}/subscribers`, { form: { subscribers } }); }
-  deleteSubscribers(listId, subscribers) { return this.request("DELETE", `/lists/${listId}/subscribers`, { form: { subscribers } }); }
+  // ---- Subscribers
+  getSubscriber(identifier) { return this.request("GET", `/subscribers/identifier/${encodeURIComponent(identifier)}`); }
+  searchSubscribers(listId, searchKey, offset = 0, size = 50) {
+    return this.request("POST", "/subscribers/search", { query: { listId, searchKey, offset, size } });
+  }
+  createSubscriber(body) { return this.request("POST", "/subscribers", { body }); }
+  updateSubscriber(id, body) { return this.request("PUT", `/subscribers/${id}`, { body }); }
+  deleteSubscriber(id) { return this.request("DELETE", `/subscribers/${id}`); }
+  unsubscribe(body) { return this.request("POST", "/req/unsubscribe", { body }); }
+  resubscribe(body) { return this.request("POST", "/req/subscribe", { body }); }
 
   // ---- Personal fields
-  getPersonalFields(listId, q) { return this.request("GET", `/lists/${listId}/personal_fields`, { query: q }); }
-  createPersonalFields(listId, personal_fields) { return this.request("POST", `/lists/${listId}/personal_fields`, { form: { personal_fields } }); }
-  updatePersonalFields(listId, personal_fields) { return this.request("PUT", `/lists/${listId}/personal_fields`, { form: { personal_fields } }); }
-  deletePersonalFields(listId, personal_fields) { return this.request("DELETE", `/lists/${listId}/personal_fields`, { form: { personal_fields } }); }
+  getPersonalFields() { return this.request("GET", "/personal-fields"); }
+  createPersonalField(body) { return this.request("POST", "/personal-fields", { body }); }
+  updatePersonalField(id, body) { return this.request("PUT", `/personal-fields/${id}`, { body }); }
 
-  // ---- Views (segments / "kvutzot mishloach")
-  getViews(listId, q) { return this.request("GET", `/lists/${listId}/views`, { query: q }); }
-  createViews(listId, views) { return this.request("POST", `/lists/${listId}/views`, { form: { views } }); }
-  updateViews(listId, views) { return this.request("PUT", `/lists/${listId}/views`, { form: { views } }); }
-  deleteViews(listId, views) { return this.request("DELETE", `/lists/${listId}/views`, { form: { views } }); }
-  getViewSubscribers(listId, viewId, q) { return this.request("GET", `/lists/${listId}/views/${viewId}/subscribers`, { query: q }); }
-  addViewSubscribers(listId, viewId, subscribers) { return this.request("POST", `/lists/${listId}/views/${viewId}/subscribers`, { form: { subscribers } }); }
-  removeViewSubscribers(listId, viewId, subscribers) { return this.request("DELETE", `/lists/${listId}/views/${viewId}/subscribers`, { form: { subscribers } }); }
+  // ---- Tags
+  getTags() { return this.request("GET", "/tags/subscribers"); }
+  getSubscriberTags(subscriberId) { return this.request("GET", `/tags/subscribers/${subscriberId}`); }
+  createTag(name) { return this.request("POST", "/tags/subscribers", { body: { name } }); }
+  removeTag(subscriberId, tagId) { return this.request("DELETE", `/subscribers/${subscriberId}/tags/${tagId}`); }
 
-  // ---- Messages
-  getMessages(listId, q) { return this.request("GET", `/lists/${listId}/messages`, { query: q }); }
-  getMessage(listId, messageId) { return this.request("GET", `/lists/${listId}/messages/${messageId}`); }
-  createMessage(listId, info) { return this.request("POST", `/lists/${listId}/messages`, { form: { info } }); }
-  updateMessage(listId, messageId, info) { return this.request("PUT", `/lists/${listId}/messages/${messageId}`, { form: { info: { ...info, ID: String(messageId) } } }); }
-  testMessage(listId, messageId, data) { return this.request("POST", `/lists/${listId}/messages/${messageId}/test`, { form: { data } }); }
-  sendMessage(listId, messageId) { return this.request("POST", `/lists/${listId}/messages/${messageId}`); }
-  deleteMessages(listId, messages_ids) { return this.request("DELETE", `/lists/${listId}/messages`, { form: { messages_ids } }); }
+  // ---- Do-not-mail ("unwanted") lists
+  getUnwantedEmails() { return this.request("GET", "/emails/unwanted"); }
+  addUnwantedEmail(email) { return this.request("POST", "/emails/unwanted", { body: { email } }); }
+  removeUnwantedEmail(email) { return this.request("POST", "/emails/unwanted/delete", { body: { email } }); }
+  getUnwantedPhones() { return this.request("GET", "/phones/unwanted"); }
+  addUnwantedPhone(phone) { return this.request("POST", "/phones/unwanted", { body: { phone } }); }
+  removeUnwantedPhone(phone) { return this.request("POST", "/phones/unwanted/delete", { body: { phone } }); }
 }
