@@ -64,6 +64,7 @@ test("rejects bad token", async () => {
 test("lists tools with safety annotations", async () => {
   const { tools } = await client.listTools();
   assert.ok(tools.length >= 20, String(tools.length));
+  assert.ok(!tools.some((t) => t.name.startsWith("old_")), "no old-system tools without its keys");
   assert.equal(tools.find((t) => t.name === "delete_subscriber").annotations.destructiveHint, true);
   assert.equal(tools.find((t) => t.name === "list_lists").annotations.readOnlyHint, true);
 });

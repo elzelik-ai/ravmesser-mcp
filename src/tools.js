@@ -1,6 +1,7 @@
 // MCP tool definitions for Rav Messer (Responder Live API V2).
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { registerLegacyTools } from "./legacy-tools.js";
 
 const id = z.union([z.number().int(), z.string().regex(/^\d+$/)]).describe("Numeric ID");
 const listId = id.describe("List ID (from list_lists)");
@@ -20,10 +21,11 @@ const json = (data) => ({ content: [{ type: "text", text: JSON.stringify(data, n
 const toInt = (v) => Number(v);
 
 /**
- * @param {import("./responder.js").ResponderClient} client
- * @param {{readOnly?: boolean}} opts
+ * @param {import("./responder.js").ResponderClient} client  new system (Responder Live)
+ * @param {{readOnly?: boolean, legacy?: import("./legacy-responder.js").LegacyResponderClient}} opts
+ *   legacy: client for the old system; its old_* tools are added only when its keys are configured.
  */
-export function buildServer(client, { readOnly = false } = {}) {
+export function buildServer(client, { readOnly = false, legacy } = {}) {
   const server = new McpServer({ name: "ravmesser", version: "2.0.0" });
 
   const tool = (name, { write = false, destructive = false, ...def }, handler) => {
@@ -255,6 +257,8 @@ export function buildServer(client, { readOnly = false } = {}) {
     if (!email && !phone) throw new Error("Give email or phone");
     return email ? client.removeUnwantedEmail(email) : client.removeUnwantedPhone(phone);
   });
+
+  if (legacy && !legacy.missing?.length) registerLegacyTools(server, legacy, { readOnly });
 
   return server;
 }

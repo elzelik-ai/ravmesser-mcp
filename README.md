@@ -31,6 +31,23 @@
 | `RESPONDER_CLIENT_SECRET` | Client Secret |
 | `RESPONDER_USER_TOKEN` | User Token |
 
+## המערכת הישנה של רב מסר (לא חובה)
+
+אפשר לחבר לאותו שרת גם את המערכת הישנה (api.responder.co.il).
+את המפתחות שלה מקבלים מהתמיכה של רב מסר בטלפון 03-7177777: מבקשים "מפתחות REST API למערכת הישנה".
+מקבלים ארבעה ערכים:
+
+| משתנה | ערך |
+|---|---|
+| `OLD_RESPONDER_CLIENT_KEY` | Client Key |
+| `OLD_RESPONDER_CLIENT_SECRET` | Client Secret |
+| `OLD_RESPONDER_USER_KEY` | User Key |
+| `OLD_RESPONDER_USER_SECRET` | User Secret |
+
+כשכל ארבעת הערכים מוגדרים, נוספים לשרת 25 כלים ששמם מתחיל ב-`old_`.
+בין השאר: רשימות, נרשמים, שדות אישיים, קבוצות משלוח (Views), וגם **יצירת דיוורים, שליחת בדיקה ושליחה לרשימה**.
+את שליחת הדיוור ל-API הישן אפשר לבצע רק אחרי אישור מפורש (`confirm: true`).
+
 ## אחסון ב-Render
 
 הקובץ `render.yaml` מגדיר שירות Node במסלול החינמי. את `MCP_ACCESS_TOKEN` מגדירים כמחרוזת אקראית.

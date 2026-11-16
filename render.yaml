@@ -15,5 +15,13 @@ services:
         sync: false
       - key: RESPONDER_USER_TOKEN
         sync: false
+      - key: OLD_RESPONDER_CLIENT_KEY
+        sync: false
+      - key: OLD_RESPONDER_CLIENT_SECRET
+        sync: false
+      - key: OLD_RESPONDER_USER_KEY
+        sync: false
+      - key: OLD_RESPONDER_USER_SECRET
+        sync: false
       - key: RESPONDER_READ_ONLY
         value: "false"

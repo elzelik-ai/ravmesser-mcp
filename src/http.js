@@ -3,9 +3,12 @@ import crypto from "node:crypto";
 import express from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ResponderClient } from "./responder.js";
+import { LegacyResponderClient } from "./legacy-responder.js";
 import { buildServer } from "./tools.js";
 
 const client = ResponderClient.fromEnv();
+const legacy = LegacyResponderClient.fromEnv();
+if (!legacy.missing.length) console.error("Old Rav Messer system: enabled");
 const readOnly = /^(1|true|yes)$/i.test(process.env.RESPONDER_READ_ONLY || "");
 const accessToken = process.env.MCP_ACCESS_TOKEN || "";
 if (accessToken.length < 24) {
@@ -34,7 +37,7 @@ function authorize(req, res, next) {
 
 async function handle(req, res) {
   // Stateless: a fresh server + transport per request.
-  const server = buildServer(client, { readOnly });
+  const server = buildServer(client, { readOnly, legacy });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { transport.close(); server.close(); });
   try {
