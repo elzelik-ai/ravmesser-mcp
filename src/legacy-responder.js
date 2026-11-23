@@ -27,7 +27,7 @@ export class LegacyResponderClient {
       ["OLD_RESPONDER_CLIENT_SECRET", c.clientSecret],
       ["OLD_RESPONDER_USER_KEY", c.userKey],
       ["OLD_RESPONDER_USER_SECRET", c.userSecret],
-    ].filter(([, v]) => !v).map(([k]) => k);
+    ].filter(([, v]) => !v || /^PASTE/i.test(v)).map(([k]) => k); // "PASTE_HERE" placeholder = not set yet
     c.missing = missing;
     return c;
   }
